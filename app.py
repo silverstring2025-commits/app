@@ -3,11 +3,6 @@ from pathlib import Path
 import streamlit as st
 from openai import OpenAI
 
-# ==========================================
-# 1. 여기에 OpenAI API 키를 직접 입력하세요.
-# ==========================================
-OPENAI_API_KEY = "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"  # 예: "sk-proj-..."
-
 # 상담 기록을 저장할 파일 경로 (선택 사항)
 LOG_FILE = Path("counseling_records.txt")
 
@@ -19,20 +14,19 @@ st.set_page_config(
 )
 
 st.title("🎙️ 음성 인식 기반 AI 상담 웹앱")
-st.caption("마이크로 말한 내용을 텍스트로 변환하고, 이를 바탕으로 AI가 상담을 진행하며 기록을 남깁니다.")
+st.caption("왼쪽 사이드바에 API 키를 입력한 뒤 마이크로 말하면, 음성을 텍스트로 정리하고 AI 상담 및 종료 요약을 진행합니다.")
 
 
-def get_client() -> OpenAI | None:
-    """입력된 API 키로 OpenAI 클라이언트를 반환합니다."""
-    api_key = OPENAI_API_KEY.strip()
-    if not api_key:
+def get_client(api_key: str) -> OpenAI | None:
+    """사용자가 왼쪽 화면에서 입력한 API 키로 OpenAI 클라이언트를 생성합니다."""
+    cleaned_key = (api_key or "").strip()
+    if not cleaned_key:
         return None
-    return OpenAI(api_key=api_key)
+    return OpenAI(api_key=cleaned_key)
 
 
 def transcribe_audio(client: OpenAI, audio_bytes_io, model_name: str, language: str) -> str:
     """녹음된 음성 데이터를 텍스트로 변환합니다."""
-    # st.audio_input은 WAV 형태의 BytesIO 객체를 반환하므로 파일명을 지정해 전달합니다.
     audio_bytes_io.seek(0)
     params = {
         "model": model_name,
@@ -56,53 +50,109 @@ def generate_counseling_reply(client: OpenAI, chat_model: str, system_prompt: st
     return response.choices[0].message.content.strip()
 
 
-def format_transcript_log(records: list[dict]) -> str:
-    """상담 기록을 깔끔한 텍스트 문서 형태로 정리합니다."""
-    if not records:
+def generate_session_summary(client: OpenAI, chat_model: str, records: list[dict]) -> str:
+    """전체 상담 기록을 바탕으로 고민 핵심과 상담 조언을 요약합니다."""
+    conversation_lines = []
+    for idx, item in enumerate(records, start=1):
+        conversation_lines.append(f"[{idx}회차 | {item['timestamp']}]")
+        conversation_lines.append(f"내담자(음성): {item['user_text']}")
+        conversation_lines.append(f"상담사(AI): {item['assistant_text']}")
+
+    full_conversation = "\n".join(conversation_lines)
+
+    summary_system_prompt = (
+        "당신은 상담 세션을 정리하는 전문 요약 분석가입니다. "
+        "제공된 전체 상담 대화를 읽고 내담자의 고민 핵심과 상담 조언을 명확하고 따뜻하게 정리하세요. "
+        "반드시 아래 두 섹션으로 나누어 한국어로 작성하세요:\n"
+        "1. 고민 핵심\n"
+        "2. 상담 조언"
+    )
+
+    response = client.chat.completions.create(
+        model=chat_model,
+        messages=[
+            {"role": "system", "content": summary_system_prompt},
+            {
+                "role": "user",
+                "content": f"다음 전체 상담 기록을 바탕으로 고민 핵심과 상담 조언을 요약해 주세요.\n\n{full_conversation}",
+            },
+        ],
+        temperature=0.4,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def format_transcript_log(records: list[dict], summary_text: str | None = None) -> str:
+    """상담 기록과 종료 요약 리포트를 텍스트 문서 형태로 정리합니다."""
+    if not records and not summary_text:
         return "아직 기록된 상담 내용이 없습니다."
 
     lines = [
         "=" * 60,
-        f"AI 상담 기록 요약 ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})",
+        f"AI 상담 기록 및 요약 ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})",
         "=" * 60,
         "",
     ]
+
+    if summary_text:
+        lines.extend(
+            [
+                "[상담 종료 요약 리포트]",
+                summary_text,
+                "",
+                "=" * 60,
+                "[상세 대화 기록]",
+                "",
+            ]
+        )
+
     for idx, item in enumerate(records, start=1):
         lines.append(f"[{idx}] {item['timestamp']}")
         lines.append(f"  - 인식된 음성(사용자): {item['user_text']}")
         lines.append(f"  - 상담 응답(AI): {item['assistant_text']}")
         lines.append("-" * 60)
+
     return "\n".join(lines)
 
 
-def append_to_disk_log(item: dict) -> None:
-    """로컬 텍스트 파일에 상담 기록을 누적 저장합니다."""
-    entry = (
-        f"[{item['timestamp']}]\n"
-        f"인식된 음성: {item['user_text']}\n"
-        f"상담 답변: {item['assistant_text']}\n"
-        f"{'-' * 40}\n"
-    )
+def append_to_disk_log(text_block: str) -> None:
+    """로컬 텍스트 파일에 텍스트 블록을 누적 저장합니다."""
     with LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(entry)
+        f.write(text_block + "\n")
 
 
 # 세션 상태 초기화
 if "messages" not in st.session_state:
-    # LLM 대화 히스토리용 (role, content)
     st.session_state.messages = []
 
 if "records" not in st.session_state:
-    # 화면 표시 및 텍스트 정리용 상세 기록
     st.session_state.records = []
 
 if "last_audio_id" not in st.session_state:
-    # 같은 녹음으로 rerun 될 때 중복 처리 방지용
     st.session_state.last_audio_id = None
 
+if "session_summary" not in st.session_state:
+    st.session_state.session_summary = None
 
-# 사이드바: 모델 및 상담 페르소나 설정
+if "session_ended" not in st.session_state:
+    st.session_state.session_ended = False
+
+
+# 화면 왼쪽 사이드바: API 키 직접 입력, 모델/상담 설정, 상담 종료 및 초기화
 with st.sidebar:
+    st.header("🔑 OpenAI API 키 입력")
+    user_api_key = st.text_input(
+        "API 키를 입력하세요",
+        type="password",
+        placeholder="sk-proj-...",
+        help="화면 왼쪽에 직접 입력한 API 키만 사용되며 코드에는 저장되지 않습니다.",
+    )
+    if user_api_key.strip():
+        st.success("API 키가 입력되었습니다.")
+    else:
+        st.warning("API 키를 입력해야 앱이 동작합니다.")
+
+    st.divider()
     st.header("⚙️ 상담 및 모델 설정")
 
     stt_model = st.selectbox(
@@ -137,33 +187,78 @@ with st.sidebar:
         height=160,
     )
 
+    st.divider()
+    st.subheader("📋 상담 세션 제어")
+
+    end_clicked = st.button(
+        "🏁 상담 종료 및 요약 생성",
+        type="primary",
+        use_container_width=True,
+        disabled=len(st.session_state.records) == 0,
+    )
+
     if st.button("🗑️ 대화 및 기록 초기화", use_container_width=True):
         st.session_state.messages = []
         st.session_state.records = []
         st.session_state.last_audio_id = None
+        st.session_state.session_summary = None
+        st.session_state.session_ended = False
         st.rerun()
 
 
-client = get_client()
+client = get_client(user_api_key)
 if client is None:
-    st.warning("상단 코드의 `OPENAI_API_KEY` 변수에 OpenAI API 키를 입력한 뒤 새로고침하거나 음성을 녹음해 주세요.")
+    st.info("왼쪽 사이드바에서 **OpenAI API 키**를 먼저 입력해 주세요.")
 
 
-# 메인 레이아웃: 좌측(음성 녹음 및 상담 대화), 우측(텍스트 기록 정리 및 다운로드)
+# 상담 종료 버튼 클릭 처리
+if end_clicked:
+    if client is None:
+        st.error("API 키가 입력되지 않았습니다. 왼쪽 사이드바에 API 키를 입력해 주세요.")
+    else:
+        with st.spinner("전체 상담 내용을 분석하여 고민 핵심과 상담 조언을 요약하는 중..."):
+            try:
+                summary_result = generate_session_summary(
+                    client=client,
+                    chat_model=chat_model,
+                    records=st.session_state.records,
+                )
+                st.session_state.session_summary = summary_result
+                st.session_state.session_ended = True
+
+                if save_local_file:
+                    append_to_disk_log(
+                        f"\n{'=' * 40}\n"
+                        f"[상담 종료 요약 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]\n"
+                        f"{summary_result}\n"
+                        f"{'=' * 40}\n"
+                    )
+            except Exception as e:
+                st.error(f"상담 요약 생성 중 오류가 발생했습니다: {e}")
+
+
+# 메인 레이아웃: 좌측(음성 녹음, 상담 대화, 종료 요약), 우측(텍스트 기록 정리 및 다운로드)
 col_left, col_right = st.columns([1.15, 0.85], gap="large")
 
 with col_left:
     st.subheader("1. 마이크 녹음 및 상담 대화")
 
-    audio_value = st.audio_input("마이크 버튼을 눌러 말씀해 주세요", key="mic_recorder")
+    if st.session_state.session_ended:
+        st.success("상담이 종료되었습니다. 아래 요약 리포트를 확인하거나, '대화 및 기록 초기화'로 새 상담을 시작할 수 있습니다.")
 
-    if audio_value is not None:
+    audio_value = st.audio_input(
+        "마이크 버튼을 눌러 말씀해 주세요",
+        key="mic_recorder",
+        disabled=st.session_state.session_ended,
+    )
+
+    if audio_value is not None and not st.session_state.session_ended:
         raw_bytes = audio_value.getvalue()
         audio_signature = (len(raw_bytes), raw_bytes[:64])
 
         if audio_signature != st.session_state.last_audio_id:
             if client is None:
-                st.error("API 키가 비어 있어 음성을 처리할 수 없습니다. 코드의 `OPENAI_API_KEY`를 채워 주세요.")
+                st.error("API 키가 입력되지 않았습니다. 왼쪽 사이드바에 API 키를 입력해 주세요.")
             else:
                 st.session_state.last_audio_id = audio_signature
 
@@ -186,15 +281,21 @@ with col_left:
                             st.session_state.messages.append({"role": "assistant", "content": assistant_text})
 
                             # 3) 기록 저장
+                            timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             record_item = {
-                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "timestamp": timestamp_str,
                                 "user_text": user_text,
                                 "assistant_text": assistant_text,
                             }
                             st.session_state.records.append(record_item)
 
                             if save_local_file:
-                                append_to_disk_log(record_item)
+                                append_to_disk_log(
+                                    f"[{timestamp_str}]\n"
+                                    f"인식된 음성: {user_text}\n"
+                                    f"상담 답변: {assistant_text}\n"
+                                    f"{'-' * 40}"
+                                )
 
                     except Exception as e:
                         st.error(f"처리 중 오류가 발생했습니다: {e}")
@@ -210,25 +311,33 @@ with col_left:
             with st.chat_message(role_label):
                 st.markdown(msg["content"])
 
+    # 상담 종료 시 전체 요약 리포트 표시
+    if st.session_state.session_summary:
+        st.divider()
+        st.subheader("📌 상담 종료 요약 (고민 핵심 & 상담 조언)")
+        st.markdown(st.session_state.session_summary)
+
 
 with col_right:
     st.subheader("2. 인식 음성 및 상담 텍스트 기록")
 
-    formatted_log = format_transcript_log(st.session_state.records)
+    formatted_log = format_transcript_log(
+        records=st.session_state.records,
+        summary_text=st.session_state.session_summary,
+    )
 
-    # 기록 텍스트를 직접 확인하거나 복사/수정할 수 있도록 표시
     st.text_area(
-        "정리된 상담 기록",
+        "정리된 상담 기록 (요약 포함)",
         value=formatted_log,
-        height=420,
+        height=460,
     )
 
     st.download_button(
-        label="📥 상담 기록 텍스트(.txt) 다운로드",
+        label="📥 상담 기록 및 요약(.txt) 다운로드",
         data=formatted_log.encode("utf-8"),
-        file_name=f"상담기록_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+        file_name=f"상담기록_요약_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
         mime="text/plain",
-        disabled=len(st.session_state.records) == 0,
+        disabled=len(st.session_state.records) == 0 and not st.session_state.session_summary,
         use_container_width=True,
     )
 
